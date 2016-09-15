@@ -21,13 +21,16 @@ import com.google.atap.tangoservice.Tango.OnTangoUpdateListener;
 import com.google.atap.tangoservice.TangoCameraIntrinsics;
 import com.google.atap.tangoservice.TangoConfig;
 import com.google.atap.tangoservice.TangoCoordinateFramePair;
+import com.google.atap.tangoservice.TangoErrorException;
 import com.google.atap.tangoservice.TangoEvent;
 import com.google.atap.tangoservice.TangoException;
 import com.google.atap.tangoservice.TangoOutOfDateException;
+import com.google.atap.tangoservice.TangoPointCloudData;
 import com.google.atap.tangoservice.TangoPoseData;
 import com.google.atap.tangoservice.TangoXyzIjData;
 
 import android.app.Activity;
+import android.opengl.Matrix;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.MotionEvent;
@@ -40,8 +43,6 @@ import org.rajawali3d.surface.RajawaliSurfaceView;
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import com.projecttango.rajawali.DeviceExtrinsics;
-import com.projecttango.rajawali.ScenePoseCalculator;
 import com.projecttango.tangosupport.TangoPointCloudManager;
 import com.projecttango.tangosupport.TangoSupport;
 import com.projecttango.tangosupport.TangoSupport.IntersectionPointPlaneModelPair;
@@ -51,43 +52,39 @@ import com.projecttango.tangosupport.TangoSupport.IntersectionPointPlaneModelPai
  * that uses depth perception to detect flat surfaces on the real world.
  * This example displays a cube in space. whenever the user clicks on the screen, the cube is placed
  * flush with the surface detected with the depth camera in the position clicked.
- *
+ * <p/>
  * This example uses Rajawali for the OpenGL rendering. This includes the color camera image in the
  * background and the cube with instructions positioned in space or in the last surface detected.
  * This part is implemented in the {@code AugmentedRealityRenderer} class, like a regular Rajawali
  * application.
- *
+ * <p/>
  * This example focuses on using the depth sensor data to detect a plane and position it on the
  * corresponding position in the 3D OpenGL space.
- *
+ * <p/>
  * For more details on the augmented reality effects, including color camera texture rendering,
  * see java_augmented_reality_example or java_hello_video_example.
- *
+ * <p/>
  * Note that it is important to include the KEY_BOOLEAN_LOWLATENCYIMUINTEGRATION
  * configuration parameter in order to achieve best results synchronizing the
  * Rajawali virtual world with the RGB camera.
  */
 public class PlaneFittingActivity extends Activity implements View.OnTouchListener {
     private static final String TAG = PlaneFittingActivity.class.getSimpleName();
+    private static final int INVALID_TEXTURE_ID = 0;
+
     private RajawaliSurfaceView mSurfaceView;
     private PlaneFittingRenderer mRenderer;
     private TangoCameraIntrinsics mIntrinsics;
-    private DeviceExtrinsics mExtrinsics;
     private TangoPointCloudManager mPointCloudManager;
     private Tango mTango;
-    private AtomicBoolean mIsConnected = new AtomicBoolean(false);
+    private boolean mIsConnected = false;
     private double mCameraPoseTimestamp = 0;
 
     // Texture rendering related fields
     // NOTE: Naming indicates which thread is in charge of updating this variable
-    private int mConnectedTextureIdGlThread = -1;  // We use the -1 (invalid texture name) to
-                                                   // to indicate that no texture is connected
-    private boolean mIsFrameAvailableTangoThread;
+    private int mConnectedTextureIdGlThread = INVALID_TEXTURE_ID;
+    private AtomicBoolean mIsFrameAvailableTangoThread = new AtomicBoolean(false);
     private double mRgbTimestampGlThread;
-
-    public static final TangoCoordinateFramePair FRAME_PAIR = new TangoCoordinateFramePair(
-            TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
-            TangoPoseData.COORDINATE_FRAME_DEVICE);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -96,7 +93,6 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
         mRenderer = new PlaneFittingRenderer(this);
         mSurfaceView.setSurfaceRenderer(mRenderer);
         mSurfaceView.setOnTouchListener(this);
-        mTango = new Tango(this);
         mPointCloudManager = new TangoPointCloudManager();
         setContentView(mSurfaceView);
     }
@@ -107,13 +103,14 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
         // Synchronize against disconnecting while the service is being used in the OpenGL thread or
         // in the UI thread.
         synchronized (this) {
-            if (mIsConnected.compareAndSet(true, false)) {
+            if (mIsConnected) {
                 mRenderer.getCurrentScene().clearFrameCallbacks();
                 mTango.disconnectCamera(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
                 // We need to invalidate the connected texture ID so that we cause a re-connection
                 // in the OpenGL thread after resume
-                mConnectedTextureIdGlThread = -1;
+                mConnectedTextureIdGlThread = INVALID_TEXTURE_ID;
                 mTango.disconnect();
+                mIsConnected = false;
             }
         }
     }
@@ -123,16 +120,27 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
         super.onResume();
         // Synchronize against disconnecting while the service is being used in the OpenGL thread or
         // in the UI thread.
-        synchronized (this) {
-            if (mIsConnected.compareAndSet(false, true)) {
-                try {
-                    connectTango();
-                    connectRenderer();
-                } catch (TangoOutOfDateException e) {
-                    Toast.makeText(getApplicationContext(), R.string.exception_out_of_date,
-                            Toast.LENGTH_SHORT).show();
+        if (!mIsConnected) {
+            // Initialize Tango Service as a normal Android Service, since we call 
+            // mTango.disconnect() in onPause, this will unbind Tango Service, so
+            // everytime when onResume get called, we should create a new Tango object.
+            mTango = new Tango(PlaneFittingActivity.this, new Runnable() {
+                // Pass in a Runnable to be called from UI thread when Tango is ready,
+                // this Runnable will be running on a new thread.
+                // When Tango is ready, we can call Tango functions safely here only
+                // when there is no UI thread changes involved.
+                @Override
+                public void run() {
+                    try {
+                        TangoSupport.initialize();
+                        connectTango();
+                        connectRenderer();
+                        mIsConnected = true;
+                    } catch (TangoOutOfDateException e) {
+                        Log.e(TAG, getString(R.string.exception_out_of_date), e);
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -147,7 +155,15 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
         // virtual objects with the RBG image and produce a good AR effect.
         config.putBoolean(TangoConfig.KEY_BOOLEAN_LOWLATENCYIMUINTEGRATION, true);
         config.putBoolean(TangoConfig.KEY_BOOLEAN_DEPTH, true);
+        config.putInt(TangoConfig.KEY_INT_DEPTH_MODE, TangoConfig.TANGO_DEPTH_MODE_POINT_CLOUD);
         config.putBoolean(TangoConfig.KEY_BOOLEAN_COLORCAMERA, true);
+
+        // Drift correction allows motion tracking to recover after it loses tracking.
+        //
+        // The drift corrected pose is is available through the frame pair with
+        // base frame AREA_DESCRIPTION and target frame DEVICE.
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_DRIFT_CORRECTION, true);
+
         mTango.connect(config);
 
         // No need to add any coordinate frame pairs since we are not
@@ -164,18 +180,21 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
                 // Check if the frame available is for the camera we want and update its frame
                 // on the view.
                 if (cameraId == TangoCameraIntrinsics.TANGO_CAMERA_COLOR) {
-                    // Mark
-                    synchronized (PlaneFittingActivity.this) {
-                        mIsFrameAvailableTangoThread = true;
-                    }
+                    // Mark a camera frame is available for rendering in the OpenGL thread
+                    mIsFrameAvailableTangoThread.set(true);
                     mSurfaceView.requestRender();
                 }
             }
 
             @Override
             public void onXyzIjAvailable(TangoXyzIjData xyzIj) {
+                // We are not using onXyzIjAvailable for this app.
+            }
+
+            @Override
+            public void onPointCloudAvailable(TangoPointCloudData pointCloud) {
                 // Save the cloud and point data for later use.
-                mPointCloudManager.updateXyzIj(xyzIj);
+                mPointCloudManager.updatePointCloud(pointCloud);
             }
 
             @Override
@@ -184,9 +203,6 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
             }
         });
 
-        // Get extrinsics from device for use in transforms. This needs
-        // to be done after connecting Tango and listeners.
-        mExtrinsics = setupExtrinsics(mTango);
         mIntrinsics = mTango.getCameraIntrinsics(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
     }
 
@@ -204,46 +220,71 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
                 // onRender callbacks had a chance to run and before scene objects are rendered
                 // into the scene.
 
-                synchronized (PlaneFittingActivity.this) {
-                    // Don't execute any tango API actions if we're not connected to the service
-                    if (!mIsConnected.get()) {
-                        return;
-                    }
+                try {
+                    synchronized (PlaneFittingActivity.this) {
+                        // Don't execute any tango API actions if we're not connected to the service
+                        if (!mIsConnected) {
+                            return;
+                        }
 
-                    // Set-up scene camera projection to match RGB camera intrinsics
-                    if (!mRenderer.isSceneCameraConfigured()) {
-                        mRenderer.setProjectionMatrix(mIntrinsics);
-                    }
+                        // Set-up scene camera projection to match RGB camera intrinsics
+                        if (!mRenderer.isSceneCameraConfigured()) {
+                            mRenderer.setProjectionMatrix(
+                                    projectionMatrixFromCameraIntrinsics(mIntrinsics));
+                        }
 
-                    // Connect the camera texture to the OpenGL Texture if necessary
-                    // NOTE: When the OpenGL context is recycled, Rajawali may re-generate the
-                    // texture with a different ID.
-                    if (mConnectedTextureIdGlThread != mRenderer.getTextureId()) {
-                        mTango.connectTextureId(TangoCameraIntrinsics.TANGO_CAMERA_COLOR,
-                                mRenderer.getTextureId());
-                        mConnectedTextureIdGlThread = mRenderer.getTextureId();
-                        Log.d(TAG, "connected to texture id: " + mRenderer.getTextureId());
-                    }
+                        // Connect the camera texture to the OpenGL Texture if necessary
+                        // NOTE: When the OpenGL context is recycled, Rajawali may re-generate the
+                        // texture with a different ID.
+                        if (mConnectedTextureIdGlThread != mRenderer.getTextureId()) {
+                            mTango.connectTextureId(TangoCameraIntrinsics.TANGO_CAMERA_COLOR,
+                                    mRenderer.getTextureId());
+                            mConnectedTextureIdGlThread = mRenderer.getTextureId();
+                            Log.d(TAG, "connected to texture id: " + mRenderer.getTextureId());
+                        }
 
-                    // If there is a new RGB camera frame available, update the texture with it
-                    if (mIsFrameAvailableTangoThread) {
-                        mRgbTimestampGlThread =
-                                mTango.updateTexture(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
-                        mIsFrameAvailableTangoThread = false;
-                    }
+                        // If there is a new RGB camera frame available, update the texture with it
+                        if (mIsFrameAvailableTangoThread.compareAndSet(true, false)) {
+                            mRgbTimestampGlThread =
+                                    mTango.updateTexture(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
+                        }
 
-                    if (mRgbTimestampGlThread > mCameraPoseTimestamp) {
-                        // Calculate the device pose at the camera frame update time.
-                        TangoPoseData lastFramePose = mTango.getPoseAtTime(mRgbTimestampGlThread,
-                            FRAME_PAIR);
-                        if (lastFramePose.statusCode == TangoPoseData.POSE_VALID) {
-                            // Update the camera pose from the renderer
-                            mRenderer.updateRenderCameraPose(lastFramePose, mExtrinsics);
-                            mCameraPoseTimestamp = lastFramePose.timestamp;
-                        } else {
-                            Log.w(TAG, "Can't get device pose at time: " + mRgbTimestampGlThread);
+                        if (mRgbTimestampGlThread > mCameraPoseTimestamp) {
+                            // Calculate the camera color pose at the camera frame update time in
+                            // OpenGL engine.
+                            //
+                            // When drift correction mode is enabled in config file, we need
+                            // to query the device with respect to Area Description pose in
+                            // order to use the drift corrected pose.
+                            //
+                            // Note that if you don't want to use the drift corrected pose, the
+                            // normal device with respect to start of service pose is still
+                            // available.
+                            TangoPoseData lastFramePose = TangoSupport.getPoseAtTime(
+                                    mRgbTimestampGlThread,
+                                    TangoPoseData.COORDINATE_FRAME_AREA_DESCRIPTION,
+                                    TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR,
+                                    TangoSupport.TANGO_SUPPORT_ENGINE_OPENGL, 0);
+                            if (lastFramePose.statusCode == TangoPoseData.POSE_VALID) {
+                                // Update the camera pose from the renderer
+                                mRenderer.updateRenderCameraPose(lastFramePose);
+                                mCameraPoseTimestamp = lastFramePose.timestamp;
+                            } else {
+                                // When the pose status is not valid, it indicates the tracking has
+                                // been lost. In this case, we simply stop rendering.
+                                //
+                                // This is also the place to display UI to suggest the user walk
+                                // to recover tracking.
+                                Log.w(TAG, "Can't get device pose at time: " +
+                                        mRgbTimestampGlThread);
+                            }
                         }
                     }
+                    // Avoid crashing the application due to unhandled exceptions
+                } catch (TangoErrorException e) {
+                    Log.e(TAG, "Tango API call error within the OpenGL render thread", e);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Exception on the OpenGL thread", t);
                 }
             }
 
@@ -265,25 +306,29 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
     }
 
     /**
-     * Calculates and stores the fixed transformations between the device and
-     * the various sensors to be used later for transformations between frames.
+     * Use Tango camera intrinsics to calculate the projection Matrix for the Rajawali scene.
      */
-    private static DeviceExtrinsics setupExtrinsics(Tango tango) {
-        // Create camera to IMU transform.
-        TangoCoordinateFramePair framePair = new TangoCoordinateFramePair();
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR;
-        TangoPoseData imuTrgbPose = tango.getPoseAtTime(0.0, framePair);
+    private static float[] projectionMatrixFromCameraIntrinsics(TangoCameraIntrinsics intrinsics) {
+        // Uses frustumM to create a projection matrix taking into account calibrated camera
+        // intrinsic parameter.
+        // Reference: http://ksimek.github.io/2013/06/03/calibrated_cameras_in_opengl/
+        float near = 0.1f;
+        float far = 100;
 
-        // Create device to IMU transform.
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_DEVICE;
-        TangoPoseData imuTdevicePose = tango.getPoseAtTime(0.0, framePair);
+        float xScale = near / (float) intrinsics.fx;
+        float yScale = near / (float) intrinsics.fy;
+        float xOffset = (float) (intrinsics.cx - (intrinsics.width / 2.0)) * xScale;
+        // Color camera's coordinates has y pointing downwards so we negate this term.
+        float yOffset = (float) -(intrinsics.cy - (intrinsics.height / 2.0)) * yScale;
 
-        // Create depth camera to IMU transform.
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH;
-        TangoPoseData imuTdepthPose = tango.getPoseAtTime(0.0, framePair);
-
-        return new DeviceExtrinsics(imuTdevicePose, imuTrgbPose, imuTdepthPose);
+        float m[] = new float[16];
+        Matrix.frustumM(m, 0,
+                xScale * (float) -intrinsics.width / 2.0f - xOffset,
+                xScale * (float) intrinsics.width / 2.0f - xOffset,
+                yScale * (float) -intrinsics.height / 2.0f - yOffset,
+                yScale * (float) intrinsics.height / 2.0f - yOffset,
+                near, far);
+        return m;
     }
 
     @Override
@@ -297,15 +342,15 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
                 // Fit a plane on the clicked point using the latest poiont cloud data
                 // Synchronize against concurrent access to the RGB timestamp in the OpenGL thread
                 // and a possible service disconnection due to an onPause event.
-                TangoPoseData planeFitPose;
+                float[] planeFitTransform;
                 synchronized (this) {
-                    planeFitPose = doFitPlane(u, v, mRgbTimestampGlThread);
+                    planeFitTransform = doFitPlane(u, v, mRgbTimestampGlThread);
                 }
 
-                if (planeFitPose != null) {
+                if (planeFitTransform != null) {
                     // Update the position of the rendered cube to the pose of the detected plane
                     // This update is made thread safe by the renderer
-                    mRenderer.updateObjectPose(planeFitPose);
+                    mRenderer.updateObjectPose(planeFitTransform);
                 }
 
             } catch (TangoException t) {
@@ -326,12 +371,12 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
     /**
      * Use the TangoSupport library with point cloud data to calculate the plane
      * of the world feature pointed at the location the camera is looking.
-     * It returns the pose of the fitted plane in a TangoPoseData structure.
+     * It returns the transform of the fitted plane in a double array.
      */
-    private TangoPoseData doFitPlane(float u, float v, double rgbTimestamp) {
-        TangoXyzIjData xyzIj = mPointCloudManager.getLatestXyzIj();
+    private float[] doFitPlane(float u, float v, double rgbTimestamp) {
+        TangoPointCloudData pointCloud = mPointCloudManager.getLatestPointCloud();
 
-        if (xyzIj == null) {
+        if (pointCloud == null) {
             return null;
         }
 
@@ -340,22 +385,99 @@ public class PlaneFittingActivity extends Activity implements View.OnTouchListen
         // cloud was acquired.
         TangoPoseData colorTdepthPose = TangoSupport.calculateRelativePose(
                 rgbTimestamp, TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR,
-                xyzIj.timestamp, TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH);
+                pointCloud.timestamp, TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH);
 
         // Perform plane fitting with the latest available point cloud data.
         IntersectionPointPlaneModelPair intersectionPointPlaneModelPair =
-                TangoSupport.fitPlaneModelNearClick(xyzIj, mIntrinsics,
+                TangoSupport.fitPlaneModelNearPoint(pointCloud,
                         colorTdepthPose, u, v);
 
-        // Get the device pose at the time the plane data was acquired.
-        TangoPoseData devicePose =
-                mTango.getPoseAtTime(xyzIj.timestamp, FRAME_PAIR);
+        // Get the transform from depth camera to OpenGL world at the timestamp of the cloud.
+        TangoSupport.TangoMatrixTransformData transform =
+                TangoSupport.getMatrixTransformAtTime(pointCloud.timestamp,
+                        TangoPoseData.COORDINATE_FRAME_AREA_DESCRIPTION,
+                        TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH,
+                        TangoSupport.TANGO_SUPPORT_ENGINE_OPENGL,
+                        TangoSupport.TANGO_SUPPORT_ENGINE_TANGO);
+        if (transform.statusCode == TangoPoseData.POSE_VALID) {
+            float[] openGlTPlane = calculatePlaneTransform(
+                    intersectionPointPlaneModelPair.intersectionPoint,
+                    intersectionPointPlaneModelPair.planeModel, transform.matrix);
 
-        // Update the AR object location.
-        TangoPoseData planeFitPose = ScenePoseCalculator.planeFitToTangoWorldPose(
-                intersectionPointPlaneModelPair.intersectionPoint,
-                intersectionPointPlaneModelPair.planeModel, devicePose, mExtrinsics);
+            return openGlTPlane;
+        } else {
+            Log.w(TAG, "Can't get depth camera transform at time " + pointCloud.timestamp);
+            return null;
+        }
+    }
 
-        return planeFitPose;
+    /**
+     * Calculate the pose of the plane based on the position and normal orientation of the plane
+     * and align it with gravity.
+     */
+    private float[] calculatePlaneTransform(double[] point, double normal[],
+                                            float[] openGlTdepth) {
+        // Vector aligned to gravity.
+        float[] openGlUp = new float[]{0, 1, 0, 0};
+        float[] depthTOpenGl = new float[16];
+        Matrix.invertM(depthTOpenGl, 0, openGlTdepth, 0);
+        float[] depthUp = new float[4];
+        Matrix.multiplyMV(depthUp, 0, depthTOpenGl, 0, openGlUp, 0);
+        // Create the plane matrix transform in depth frame from a point, the plane normal and the
+        // up vector.
+        float[] depthTplane = matrixFromPointNormalUp(point, normal, depthUp);
+        float[] openGlTplane = new float[16];
+        Matrix.multiplyMM(openGlTplane, 0, openGlTdepth, 0, depthTplane, 0);
+        return openGlTplane;
+    }
+
+    /**
+     * Calculates a transformation matrix based on a point, a normal and the up gravity vector.
+     * The coordinate frame of the target transformation will a right handed system with Z+ in
+     * the direction of the normal and Y+ up.
+     */
+    private float[] matrixFromPointNormalUp(double[] point, double[] normal, float[] up) {
+        float[] zAxis = new float[]{(float) normal[0], (float) normal[1], (float) normal[2]};
+        normalize(zAxis);
+        float[] xAxis = crossProduct(up, zAxis);
+        normalize(xAxis);
+        float[] yAxis = crossProduct(zAxis, xAxis);
+        normalize(yAxis);
+        float[] m = new float[16];
+        Matrix.setIdentityM(m, 0);
+        m[0] = xAxis[0];
+        m[1] = xAxis[1];
+        m[2] = xAxis[2];
+        m[4] = yAxis[0];
+        m[5] = yAxis[1];
+        m[6] = yAxis[2];
+        m[8] = zAxis[0];
+        m[9] = zAxis[1];
+        m[10] = zAxis[2];
+        m[12] = (float) point[0];
+        m[13] = (float) point[1];
+        m[14] = (float) point[2];
+        return m;
+    }
+
+    /**
+     * Normalize a vector.
+     */
+    private void normalize(float[] v) {
+        double norm = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        v[0] /= norm;
+        v[1] /= norm;
+        v[2] /= norm;
+    }
+
+    /**
+     * Cross product between two vectors following the right hand rule.
+     */
+    private float[] crossProduct(float[] v1, float[] v2) {
+        float[] result = new float[3];
+        result[0] = v1[1] * v2[2] - v2[1] * v1[2];
+        result[1] = v1[2] * v2[0] - v2[2] * v1[0];
+        result[2] = v1[0] * v2[1] - v2[0] * v1[1];
+        return result;
     }
 }

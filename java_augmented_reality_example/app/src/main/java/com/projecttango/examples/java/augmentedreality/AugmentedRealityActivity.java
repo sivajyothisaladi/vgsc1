@@ -21,15 +21,19 @@ import com.google.atap.tangoservice.Tango.OnTangoUpdateListener;
 import com.google.atap.tangoservice.TangoCameraIntrinsics;
 import com.google.atap.tangoservice.TangoConfig;
 import com.google.atap.tangoservice.TangoCoordinateFramePair;
+import com.google.atap.tangoservice.TangoErrorException;
 import com.google.atap.tangoservice.TangoEvent;
 import com.google.atap.tangoservice.TangoOutOfDateException;
+import com.google.atap.tangoservice.TangoPointCloudData;
 import com.google.atap.tangoservice.TangoPoseData;
 import com.google.atap.tangoservice.TangoXyzIjData;
 
 import android.app.Activity;
+import android.opengl.GLSurfaceView;
+import android.opengl.Matrix;
 import android.os.Bundle;
 import android.util.Log;
-import android.widget.Toast;
+import android.view.Surface;
 
 import org.rajawali3d.scene.ASceneFrameCallback;
 import org.rajawali3d.surface.RajawaliSurfaceView;
@@ -37,45 +41,43 @@ import org.rajawali3d.surface.RajawaliSurfaceView;
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import com.projecttango.rajawali.DeviceExtrinsics;
+import com.projecttango.tangosupport.TangoSupport;
 
 /**
- * An example showing how to use the Tango APIs to create an augmented reality application.
- * It displays the planet earth floating in space one meter in front of the device.
- *
+ * This is a simple example that shows how to use the Tango APIs to create an augmented reality (AR)
+ * application. It displays the Planet Earth floating in space one meter in front of the device, and
+ * the Moon rotating around it.
+ * <p/>
  * This example uses Rajawali for the OpenGL rendering. This includes the color camera image in the
- * background and a 3D sphere with a texture of the earth floating in space three meter forward.
+ * background and a 3D sphere with a texture of the Earth floating in space three meter forward.
  * This part is implemented in the {@code AugmentedRealityRenderer} class, like a regular Rajawali
  * application.
- *
+ * <p/>
  * This example focuses on how to use the Tango APIs to get the color camera data into an OpenGL
  * texture efficiently and have the OpenGL camera track the movement of the device in order to
  * achieve an augmented reality effect.
- *
+ * <p/>
  * Note that it is important to include the KEY_BOOLEAN_LOWLATENCYIMUINTEGRATION configuration
  * parameter in order to achieve best results synchronizing the Rajawali virtual world with the
  * RGB camera.
- *
+ * <p/>
  * If you're looking for a more stripped down example that doesn't use a rendering library like
  * Rajawali, see java_hello_video_example.
  */
 public class AugmentedRealityActivity extends Activity {
     private static final String TAG = AugmentedRealityActivity.class.getSimpleName();
-    private static final TangoCoordinateFramePair FRAME_PAIR = new TangoCoordinateFramePair(
-            TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
-            TangoPoseData.COORDINATE_FRAME_DEVICE);
-    private static final int INVALID_TEXTURE_ID = -1;
+    private static final int INVALID_TEXTURE_ID = 0;
 
     private RajawaliSurfaceView mSurfaceView;
     private AugmentedRealityRenderer mRenderer;
     private TangoCameraIntrinsics mIntrinsics;
-    private DeviceExtrinsics mExtrinsics;
     private Tango mTango;
-    private AtomicBoolean mIsConnected = new AtomicBoolean(false);
+    private TangoConfig mConfig;
+    private boolean mIsConnected = false;
     private double mCameraPoseTimestamp = 0;
 
-    // Texture rendering related fields
-    // NOTE: Naming indicates which thread is in charge of updating this variable
+    // Texture rendering related fields.
+    // NOTE: Naming indicates which thread is in charge of updating this variable.
     private int mConnectedTextureIdGlThread = INVALID_TEXTURE_ID;
     private AtomicBoolean mIsFrameAvailableTangoThread = new AtomicBoolean(false);
     private double mRgbTimestampGlThread;
@@ -83,81 +85,123 @@ public class AugmentedRealityActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        mSurfaceView = new RajawaliSurfaceView(this);
+        setContentView(R.layout.activity_main);
+        mSurfaceView = (RajawaliSurfaceView) findViewById(R.id.surfaceview);
         mRenderer = new AugmentedRealityRenderer(this);
-        mSurfaceView.setSurfaceRenderer(mRenderer);
-        mTango = new Tango(this);
-        setContentView(mSurfaceView);
+        setupRenderer();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        mSurfaceView.onResume();
+        // Set render mode to RENDERMODE_CONTINUOUSLY to force getting onDraw callbacks until the
+        // Tango service is properly set-up and we start getting onFrameAvailable callbacks.
+        mSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+
+        // Initialize Tango Service as a normal Android Service, since we call
+        // mTango.disconnect() in onPause, this will unbind Tango Service, so
+        // everytime when onResume get called, we should create a new Tango object.
+        mTango = new Tango(AugmentedRealityActivity.this, new Runnable() {
+            // Pass in a Runnable to be called from UI thread when Tango is ready,
+            // this Runnable will be running on a new thread.
+            // When Tango is ready, we can call Tango functions safely here only
+            // when there is no UI thread changes involved.
+            @Override
+            public void run() {
+                // Synchronize against disconnecting while the service is being used in the OpenGL
+                // thread or in the UI thread.
+                synchronized (AugmentedRealityActivity.this) {
+                    TangoSupport.initialize();
+                    mConfig = setupTangoConfig(mTango);
+
+                    try {
+                        setTangoListeners();
+                    } catch (TangoErrorException e) {
+                        Log.e(TAG, getString(R.string.exception_tango_error), e);
+                    } catch (SecurityException e) {
+                        Log.e(TAG, getString(R.string.permission_camera), e);
+                    }
+                    try {
+                        mTango.connect(mConfig);
+                        mIsConnected = true;
+                    } catch (TangoOutOfDateException e) {
+                        Log.e(TAG, getString(R.string.exception_out_of_date), e);
+                    } catch (TangoErrorException e) {
+                        Log.e(TAG, getString(R.string.exception_tango_error), e);
+                    }
+                }
+
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        synchronized (AugmentedRealityActivity.this) {
+                            mIntrinsics = mTango.getCameraIntrinsics(
+                                    TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        mSurfaceView.onPause();
         // Synchronize against disconnecting while the service is being used in the OpenGL thread or
         // in the UI thread.
         // NOTE: DO NOT lock against this same object in the Tango callback thread. Tango.disconnect
         // will block here until all Tango callback calls are finished. If you lock against this
         // object in a Tango callback thread it will cause a deadlock.
         synchronized (this) {
-            if (mIsConnected.compareAndSet(true, false)) {
-                mRenderer.getCurrentScene().clearFrameCallbacks();
+            try {
+                mIsConnected = false;
                 mTango.disconnectCamera(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
                 // We need to invalidate the connected texture ID so that we cause a re-connection
-                // in the OpenGL thread after resume
+                // in the OpenGL thread after resume.
                 mConnectedTextureIdGlThread = INVALID_TEXTURE_ID;
                 mTango.disconnect();
-            }
-        }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        // Synchronize against disconnecting while the service is being used in the OpenGL thread or
-        // in the UI thread.
-        synchronized (this) {
-            if (mIsConnected.compareAndSet(false, true)) {
-                try {
-                    connectTango();
-                    connectRenderer();
-                } catch (TangoOutOfDateException e) {
-                    Toast.makeText(getApplicationContext(), R.string.exception_out_of_date,
-                            Toast.LENGTH_SHORT).show();
-                }
+            } catch (TangoErrorException e) {
+                Log.e(TAG, getString(R.string.exception_tango_error), e);
             }
         }
     }
 
     /**
-     * Configures the Tango service and connect it to callbacks.
+     * Sets up the tango configuration object. Make sure mTango object is initialized before
+     * making this call.
      */
-    private void connectTango() {
+    private TangoConfig setupTangoConfig(Tango tango) {
         // Use default configuration for Tango Service, plus color camera and
         // low latency IMU integration.
-        TangoConfig config = mTango.getConfig(TangoConfig.CONFIG_TYPE_DEFAULT);
+        TangoConfig config = tango.getConfig(TangoConfig.CONFIG_TYPE_DEFAULT);
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_COLORCAMERA, true);
+
         // NOTE: Low latency integration is necessary to achieve a precise alignment of
         // virtual objects with the RBG image and produce a good AR effect.
         config.putBoolean(TangoConfig.KEY_BOOLEAN_LOWLATENCYIMUINTEGRATION, true);
-        config.putBoolean(TangoConfig.KEY_BOOLEAN_COLORCAMERA, true);
-        mTango.connect(config);
 
-        // No need to add any coordinate frame pairs since we are not using pose data from callbacks
+        // Drift correction allows motion tracking to recover after it loses tracking.
+        //
+        // The drift corrected pose is is available through the frame pair with
+        // base frame AREA_DESCRIPTION and target frame DEVICE.
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_DRIFT_CORRECTION, true);
+        return config;
+    }
+
+    /**
+     * Set up the callback listeners for the Tango service, then begin using the Motion
+     * Tracking API. This is called in response to the user clicking the 'Start' Button.
+     */
+    private void setTangoListeners() {
+        // No need to add any coordinate frame pairs since we aren't using pose data from callbacks.
         ArrayList<TangoCoordinateFramePair> framePairs = new ArrayList<TangoCoordinateFramePair>();
+
         mTango.connectListener(framePairs, new OnTangoUpdateListener() {
             @Override
             public void onPoseAvailable(TangoPoseData pose) {
                 // We are not using onPoseAvailable for this app.
-            }
-
-            @Override
-            public void onFrameAvailable(int cameraId) {
-                // Check if the frame available is for the camera we want and update its frame
-                // on the view.
-                if (cameraId == TangoCameraIntrinsics.TANGO_CAMERA_COLOR) {
-                    // Mark a camera frame is available for rendering in the OpenGL thread
-                    mIsFrameAvailableTangoThread.set(true);
-                    mSurfaceView.requestRender();
-                }
             }
 
             @Override
@@ -166,21 +210,44 @@ public class AugmentedRealityActivity extends Activity {
             }
 
             @Override
+            public void onPointCloudAvailable(TangoPointCloudData pointCloud) {
+                // We are not using onPointCloudAvailable for this app.
+            }
+
+            @Override
             public void onTangoEvent(TangoEvent event) {
                 // We are not using onTangoEvent for this app.
             }
-        });
 
-        // Get extrinsics from device for use in transforms. This needs
-        // to be done after connecting Tango and listeners.
-        mExtrinsics = setupExtrinsics(mTango);
-        mIntrinsics = mTango.getCameraIntrinsics(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
+            @Override
+            public void onFrameAvailable(int cameraId) {
+                // Check if the frame available is for the camera we want and update its frame
+                // on the view.
+                if (cameraId == TangoCameraIntrinsics.TANGO_CAMERA_COLOR) {
+                    // Now that we are receiving onFrameAvailable callbacks, we can switch
+                    // to RENDERMODE_WHEN_DIRTY to drive the render loop from this callback.
+                    // This will result on a frame rate of  approximately 30FPS, in synchrony with
+                    // the RGB camera driver.
+                    // If you need to render at a higher rate (i.e.: if you want to render complex
+                    // animations smoothly) you  can use RENDERMODE_CONTINUOUSLY throughout the
+                    // application lifecycle.
+                    if (mSurfaceView.getRenderMode() != GLSurfaceView.RENDERMODE_WHEN_DIRTY) {
+                        mSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+                    }
+
+                    // Mark a camera frame is available for rendering in the OpenGL thread.
+                    mIsFrameAvailableTangoThread.set(true);
+                    // Trigger an Rajawali render to update the scene with the new RGB data.
+                    mSurfaceView.requestRender();
+                }
+            }
+        });
     }
 
     /**
      * Connects the view and renderer to the color camara and callbacks.
      */
-    private void connectRenderer() {
+    private void setupRenderer() {
         // Register a Rajawali Scene Frame Callback to update the scene camera pose whenever a new
         // RGB frame is rendered.
         // (@see https://github.com/Rajawali/Rajawali/wiki/Scene-Frame-Callbacks)
@@ -193,46 +260,72 @@ public class AugmentedRealityActivity extends Activity {
 
                 // Prevent concurrent access to {@code mIsFrameAvailableTangoThread} from the Tango
                 // callback thread and service disconnection from an onPause event.
-                synchronized (AugmentedRealityActivity.this) {
-                    // Don't execute any tango API actions if we're not connected to the service
-                    if (!mIsConnected.get()) {
-                        return;
-                    }
+                try {
+                    synchronized (AugmentedRealityActivity.this) {
+                        // Don't execute any tango API actions if we're not connected to the service
+                        if (!mIsConnected) {
+                            return;
+                        }
 
-                    // Set-up scene camera projection to match RGB camera intrinsics
-                    if (!mRenderer.isSceneCameraConfigured()) {
-                        mRenderer.setProjectionMatrix(mIntrinsics);
-                    }
+                        // Set-up scene camera projection to match RGB camera intrinsics.
+                        if (!mRenderer.isSceneCameraConfigured()) {
+                            mRenderer.setProjectionMatrix(
+                                    projectionMatrixFromCameraIntrinsics(mIntrinsics));
+                        }
+                        // Connect the camera texture to the OpenGL Texture if necessary
+                        // NOTE: When the OpenGL context is recycled, Rajawali may re-generate the
+                        // texture with a different ID.
+                        if (mConnectedTextureIdGlThread != mRenderer.getTextureId()) {
+                            mTango.connectTextureId(TangoCameraIntrinsics.TANGO_CAMERA_COLOR,
+                                    mRenderer.getTextureId());
+                            mConnectedTextureIdGlThread = mRenderer.getTextureId();
+                            Log.d(TAG, "connected to texture id: " + mRenderer.getTextureId());
+                        }
 
-                    // Connect the camera texture to the OpenGL Texture if necessary
-                    // NOTE: When the OpenGL context is recycled, Rajawali may re-generate the
-                    // texture with a different ID.
-                    if (mConnectedTextureIdGlThread != mRenderer.getTextureId()) {
-                        mTango.connectTextureId(TangoCameraIntrinsics.TANGO_CAMERA_COLOR,
-                                mRenderer.getTextureId());
-                        mConnectedTextureIdGlThread = mRenderer.getTextureId();
-                        Log.d(TAG, "connected to texture id: " + mRenderer.getTextureId());
-                    }
+                        // If there is a new RGB camera frame available, update the texture with it
+                        if (mIsFrameAvailableTangoThread.compareAndSet(true, false)) {
+                            mRgbTimestampGlThread =
+                                    mTango.updateTexture(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
+                        }
 
-                    // If there is a new RGB camera frame available, update the texture with it
-                    if (mIsFrameAvailableTangoThread.compareAndSet(true, false)) {
-                        mRgbTimestampGlThread =
-                                mTango.updateTexture(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
-                    }
-
-                    // If a new RGB frame has been rendered, update the camera pose to match.
-                    if (mRgbTimestampGlThread > mCameraPoseTimestamp) {
-                        // Calculate the device pose at the camera frame update time.
-                        TangoPoseData lastFramePose = mTango.getPoseAtTime(mRgbTimestampGlThread,
-                            FRAME_PAIR);
-                        if (lastFramePose.statusCode == TangoPoseData.POSE_VALID) {
-                            // Update the camera pose from the renderer
-                            mRenderer.updateRenderCameraPose(lastFramePose, mExtrinsics);
-                            mCameraPoseTimestamp = lastFramePose.timestamp;
-                        } else {
-                            Log.w(TAG, "Can't get device pose at time: " + mRgbTimestampGlThread);
+                        // If a new RGB frame has been rendered, update the camera pose to match.
+                        if (mRgbTimestampGlThread > mCameraPoseTimestamp) {
+                            // Calculate the camera color pose at the camera frame update time in
+                            // OpenGL engine.
+                            //
+                            // When drift correction mode is enabled in config file, we must query
+                            // the device with respect to Area Description pose in order to use the
+                            // drift corrected pose.
+                            //
+                            // Note that if you don't want to use the drift corrected pose, the
+                            // normal device with respect to start of service pose is available.
+                            TangoPoseData lastFramePose = TangoSupport.getPoseAtTime(
+                                    mRgbTimestampGlThread,
+                                    TangoPoseData.COORDINATE_FRAME_AREA_DESCRIPTION,
+                                    TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR,
+                                    TangoSupport.TANGO_SUPPORT_ENGINE_OPENGL,
+                                    Surface.ROTATION_0);
+                            if (lastFramePose.statusCode == TangoPoseData.POSE_VALID) {
+                                // Update the camera pose from the renderer
+                                mRenderer.updateRenderCameraPose(lastFramePose);
+                                mCameraPoseTimestamp = lastFramePose.timestamp;
+                            } else {
+                                // When the pose status is not valid, it indicates the tracking has
+                                // been lost. In this case, we simply stop rendering.
+                                //
+                                // This is also the place to display UI to suggest the user walk
+                                // to recover tracking.
+                                Log.w(TAG, "Can't get device pose at time: " +
+                                        mRgbTimestampGlThread);
+                            }
                         }
                     }
+
+                    // Avoid crashing the application due to unhandled exceptions
+                } catch (TangoErrorException e) {
+                    Log.e(TAG, "Tango API call error within the OpenGL render thread", e);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Exception on the OpenGL thread", t);
                 }
             }
 
@@ -251,27 +344,33 @@ public class AugmentedRealityActivity extends Activity {
                 return true;
             }
         });
+
+        mSurfaceView.setSurfaceRenderer(mRenderer);
     }
 
     /**
-     * Calculates and stores the fixed transformations between the device and
-     * the various sensors to be used later for transformations between frames.
+     * Use Tango camera intrinsics to calculate the projection Matrix for the Rajawali scene.
      */
-    private static DeviceExtrinsics setupExtrinsics(Tango tango) {
-        // Create camera to IMU transform.
-        TangoCoordinateFramePair framePair = new TangoCoordinateFramePair();
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR;
-        TangoPoseData imuTrgbPose = tango.getPoseAtTime(0.0, framePair);
+    private static float[] projectionMatrixFromCameraIntrinsics(TangoCameraIntrinsics intrinsics) {
+        // Uses frustumM to create a projection matrix taking into account calibrated camera
+        // intrinsic parameter.
+        // Reference: http://ksimek.github.io/2013/06/03/calibrated_cameras_in_opengl/
+        float near = 0.1f;
+        float far = 100;
 
-        // Create device to IMU transform.
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_DEVICE;
-        TangoPoseData imuTdevicePose = tango.getPoseAtTime(0.0, framePair);
+        float xScale = near / (float) intrinsics.fx;
+        float yScale = near / (float) intrinsics.fy;
+        float xOffset = (float) (intrinsics.cx - (intrinsics.width / 2.0)) * xScale;
+        // Color camera's coordinates has y pointing downwards so we negate this term.
+        float yOffset = (float) -(intrinsics.cy - (intrinsics.height / 2.0)) * yScale;
 
-        // Create depth camera to IMU transform.
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH;
-        TangoPoseData imuTdepthPose = tango.getPoseAtTime(0.0, framePair);
-
-        return new DeviceExtrinsics(imuTdevicePose, imuTrgbPose, imuTdepthPose);
+        float m[] = new float[16];
+        Matrix.frustumM(m, 0,
+                xScale * (float) -intrinsics.width / 2.0f - xOffset,
+                xScale * (float) intrinsics.width / 2.0f - xOffset,
+                yScale * (float) -intrinsics.height / 2.0f - yOffset,
+                yScale * (float) intrinsics.height / 2.0f - yOffset,
+                near, far);
+        return m;
     }
 }

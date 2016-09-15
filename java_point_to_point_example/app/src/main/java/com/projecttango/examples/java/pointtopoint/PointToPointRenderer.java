@@ -29,6 +29,7 @@ import org.rajawali3d.materials.Material;
 import org.rajawali3d.materials.textures.ATexture;
 import org.rajawali3d.materials.textures.StreamingTexture;
 import org.rajawali3d.math.Matrix4;
+import org.rajawali3d.math.Quaternion;
 import org.rajawali3d.math.vector.Vector3;
 import org.rajawali3d.primitives.Line3D;
 import org.rajawali3d.primitives.ScreenQuad;
@@ -38,13 +39,9 @@ import java.util.Stack;
 
 import javax.microedition.khronos.opengles.GL10;
 
-import com.projecttango.rajawali.DeviceExtrinsics;
-import com.projecttango.rajawali.Pose;
-import com.projecttango.rajawali.ScenePoseCalculator;
-
 /**
  * Very simple example point to point renderer which displays a line fixed in place.
- * Whenever the user clicks on the screen, the line is re-rendered with an endpoint 
+ * Whenever the user clicks on the screen, the line is re-rendered with an endpoint
  * placed at the point corresponding to the depth at the point of the click.
  */
 public class PointToPointRenderer extends RajawaliRenderer {
@@ -109,7 +106,7 @@ public class PointToPointRenderer extends RajawaliRenderer {
                 }
                 mLineUpdated = false;
             }
-            
+
         }
 
         super.onRender(elapsedRealTime, deltaTime);
@@ -122,15 +119,19 @@ public class PointToPointRenderer extends RajawaliRenderer {
 
     /**
      * Update the scene camera based on the provided pose in Tango start of service frame.
-     * The device pose should match the pose of the device at the time the last rendered RGB
+     * The camera pose should match the pose of the camera color at the time the last rendered RGB
      * frame, which can be retrieved with this.getTimestamp();
      * <p/>
      * NOTE: This must be called from the OpenGL render thread - it is not thread safe.
      */
-    public void updateRenderCameraPose(TangoPoseData devicePose, DeviceExtrinsics extrinsics) {
-        Pose cameraPose = ScenePoseCalculator.toOpenGlCameraPose(devicePose, extrinsics);
-        getCurrentCamera().setRotation(cameraPose.getOrientation());
-        getCurrentCamera().setPosition(cameraPose.getPosition());
+    public void updateRenderCameraPose(TangoPoseData cameraPose) {
+        float[] rotation = cameraPose.getRotationAsFloats();
+        float[] translation = cameraPose.getTranslationAsFloats();
+        Quaternion quaternion = new Quaternion(rotation[3], rotation[0], rotation[1], rotation[2]);
+        // Conjugating the Quaternion is need because Rajawali uses left handed convention for
+        // quaternions.
+        getCurrentCamera().setRotation(quaternion.conjugate());
+        getCurrentCamera().setPosition(translation[0], translation[1], translation[2]);
     }
 
     /**
@@ -160,11 +161,8 @@ public class PointToPointRenderer extends RajawaliRenderer {
      * Sets the projection matrix for the scen camera to match the parameters of the color camera,
      * provided by the {@code TangoCameraIntrinsics}.
      */
-    public void setProjectionMatrix(TangoCameraIntrinsics intrinsics) {
-        Matrix4 projectionMatrix = ScenePoseCalculator.calculateProjectionMatrix(
-                intrinsics.width, intrinsics.height,
-                intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy);
-        getCurrentCamera().setProjectionMatrix(projectionMatrix);
+    public void setProjectionMatrix(float[] matrixFloats) {
+        getCurrentCamera().setProjectionMatrix(new Matrix4(matrixFloats));
     }
 
     @Override

@@ -17,27 +17,30 @@
 package com.projecttango.examples.java.motiontracking;
 
 import com.google.atap.tangoservice.Tango;
-import com.google.atap.tangoservice.Tango.OnTangoUpdateListener;
 import com.google.atap.tangoservice.TangoConfig;
 import com.google.atap.tangoservice.TangoCoordinateFramePair;
 import com.google.atap.tangoservice.TangoErrorException;
 import com.google.atap.tangoservice.TangoEvent;
 import com.google.atap.tangoservice.TangoOutOfDateException;
+import com.google.atap.tangoservice.TangoPointCloudData;
 import com.google.atap.tangoservice.TangoPoseData;
 import com.google.atap.tangoservice.TangoXyzIjData;
 
 import android.app.Activity;
+import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Display;
-import android.view.MotionEvent;
+import android.view.Surface;
 import android.view.WindowManager;
-import android.widget.Toast;
 
-import org.rajawali3d.surface.IRajawaliSurface;
+import org.rajawali3d.scene.ASceneFrameCallback;
 import org.rajawali3d.surface.RajawaliSurfaceView;
 
 import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.projecttango.tangosupport.TangoSupport;
 
 /**
  * Main Activity class for the Motion Tracking API Sample. Handles the connection to the Tango
@@ -48,111 +51,39 @@ public class MotionTrackingActivity extends Activity {
 
     private static final String TAG = MotionTrackingActivity.class.getSimpleName();
 
+    private RajawaliSurfaceView mSurfaceView;
+    private MotionTrackingRajawaliRenderer mRenderer;
     private Tango mTango;
     private TangoConfig mConfig;
-    private MotionTrackingRajawaliRenderer mRenderer;
 
-    // The current screen rotation index. The index value follow the Android surface rotation enum:
-    // http://developer.android.com/reference/android/view/Surface.html#ROTATION_0
-    private int mScreenRotation = 0;
+    private AtomicBoolean mIsTangoPoseReady = new AtomicBoolean(false);
+
+    private int mCurrentDisplayOrientation = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_motion_tracking);
+        // OpenGL view where all of the graphics are drawn.
+        mSurfaceView = (RajawaliSurfaceView) findViewById(R.id.gl_surface_view);
+        mRenderer = new MotionTrackingRajawaliRenderer(this);
         
-        mRenderer = setupGLViewAndRenderer();
-
-        // Check the current screen rotation and set it to the renderer.
+        // Get current display orientation, note that each time display orientation
+        // changes, the onCreate function will be called again.
         WindowManager mWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         Display mDisplay = mWindowManager.getDefaultDisplay();
-        mScreenRotation = mDisplay.getOrientation();
-    }
+        mCurrentDisplayOrientation = mDisplay.getOrientation();
 
-    /**
-     * Sets Rajawalisurface view and its renderer. This is ideally called only once in onCreate.
-     */
-    private MotionTrackingRajawaliRenderer setupGLViewAndRenderer(){
-        // Configure OpenGL renderer
-        MotionTrackingRajawaliRenderer renderer = new MotionTrackingRajawaliRenderer(this);
-        // OpenGL view where all of the graphics are drawn
-        RajawaliSurfaceView glView = (RajawaliSurfaceView) findViewById(R.id.gl_surface_view);
-        glView.setEGLContextClientVersion(2);
-        glView.setRenderMode(IRajawaliSurface.RENDERMODE_CONTINUOUSLY);
-        glView.setSurfaceRenderer(renderer);
-        return renderer;
-
-    }
-
-    /**
-     * Sets up the tango configuration object. Make sure mTango object is initialized before
-     * making this call.
-     */
-    private TangoConfig setupTangoConfig(Tango tango){
-        // Create a new Tango Configuration and enable the MotionTrackingActivity API
-        TangoConfig config = new TangoConfig();
-        config = tango.getConfig(config.CONFIG_TYPE_DEFAULT);
-        config.putBoolean(TangoConfig.KEY_BOOLEAN_MOTIONTRACKING, true);
-
-        // Tango service should automatically attempt to recover when it enters an invalid state.
-        config.putBoolean(TangoConfig.KEY_BOOLEAN_AUTORECOVERY, true);
-        return  config;
-    }
-
-    /**
-     * Set up the callback listeners for the Tango service, then begin using the Motion
-     * Tracking API. This is called in response to the user clicking the 'Start' Button.
-     */
-    private void setTangoListeners() {
-        // Lock configuration and connect to Tango
-        // Select coordinate frame pair
-        final ArrayList<TangoCoordinateFramePair> framePairs =
-                new ArrayList<TangoCoordinateFramePair>();
-        framePairs.add(new TangoCoordinateFramePair(
-                TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
-                TangoPoseData.COORDINATE_FRAME_DEVICE));
-
-        // Listen for new Tango data
-        mTango.connectListener(framePairs, new OnTangoUpdateListener() {
-            @Override
-            public void onPoseAvailable(final TangoPoseData pose) {
-                // Update the OpenGL renderable objects with the new Tango Pose
-                // data.  Note that locking for thread safe access with the
-                // OpenGL loop is done entirely in the renderer.
-                mRenderer.updateDevicePose(pose, mScreenRotation);
-            }
-
-            @Override
-            public void onXyzIjAvailable(TangoXyzIjData arg0) {
-                // We are not using TangoXyzIjData for this application
-            }
-
-            @Override
-            public void onTangoEvent(final TangoEvent event) {
-            }
-
-            @Override
-            public void onFrameAvailable(int cameraId) {
-                // We are not using onFrameAvailable for this application
-            }
-        });
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        try {
-            mTango.disconnect();
-        } catch (TangoErrorException e) {
-            Toast.makeText(getApplicationContext(),
-                R.string.exception_tango_error, Toast.LENGTH_SHORT).show();
-        }
+        // Configure OpenGL renderer.
+        setupRenderer();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        // Initialize Tango Service as a normal Android Service, since we call 
+        mSurfaceView.onResume();
+
+        // Initialize Tango Service as a normal Android Service, since we call
         // mTango.disconnect() in onPause, this will unbind Tango Service, so
         // everytime when onResume get called, we should create a new Tango object.
         mTango = new Tango(MotionTrackingActivity.this, new Runnable() {
@@ -162,27 +93,162 @@ public class MotionTrackingActivity extends Activity {
             // when there is no UI thread changes involved.
             @Override
             public void run() {
-                mConfig = setupTangoConfig(mTango);
-                try {
-                    setTangoListeners();
-                } catch (TangoErrorException e) {
-                    Log.e(TAG, getString(R.string.exception_tango_error), e);
-                } catch (SecurityException e) {
-                    Log.e(TAG, getString(R.string.permission_motion_tracking), e);
-                }
-                try {
-                    mTango.connect(mConfig);
-                } catch (TangoOutOfDateException e) {
-                    Log.e(TAG, getString(R.string.exception_out_of_date), e);
-                } catch (TangoErrorException e) {
-                    Log.e(TAG, getString(R.string.exception_tango_error), e);
+                // Synchronize against disconnecting while the service is being used in the OpenGL
+                // thread or in the UI thread.
+                synchronized (MotionTrackingActivity.this) {
+                    TangoSupport.initialize();
+                    mConfig = setupTangoConfig(mTango);
+
+                    try {
+                        setTangoListeners();
+                    } catch (TangoErrorException e) {
+                        Log.e(TAG, getString(R.string.exception_tango_error), e);
+                    }
+                    try {
+                        mTango.connect(mConfig);
+                    } catch (TangoOutOfDateException e) {
+                        Log.e(TAG, getString(R.string.exception_out_of_date), e);
+                    } catch (TangoErrorException e) {
+                        Log.e(TAG, getString(R.string.exception_tango_error), e);
+                    }
                 }
             }
         });
     }
 
     @Override
-    protected void onDestroy() {
-        super.onDestroy();
+    protected void onPause() {
+        super.onPause();
+        mSurfaceView.onPause();
+        mIsTangoPoseReady.compareAndSet(true, false);
+        // Synchronize against disconnecting while the service is being used in the OpenGL thread or
+        // in the UI thread.
+        // NOTE: DO NOT lock against this same object in the Tango callback thread. Tango.disconnect
+        // will block here until all Tango callback calls are finished. If you lock against this
+        // object in a Tango callback thread it will cause a deadlock.
+        synchronized (this) {
+            try {
+                mTango.disconnect();
+            } catch (TangoErrorException e) {
+                Log.e(TAG, getString(R.string.exception_tango_error), e);
+            }
+        }
+    }
+
+    /**
+     * Sets up the tango configuration object. Make sure mTango object is initialized before
+     * making this call.
+     */
+    private TangoConfig setupTangoConfig(Tango tango) {
+        // Create a new Tango Configuration and enable the MotionTrackingActivity API.
+        TangoConfig config = new TangoConfig();
+        config = tango.getConfig(config.CONFIG_TYPE_DEFAULT);
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_MOTIONTRACKING, true);
+
+        // Tango service should automatically attempt to recover when it enters an invalid state.
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_AUTORECOVERY, true);
+        return config;
+    }
+
+    /**
+     * Set up the callback listeners for the Tango service, then begin using the Motion
+     * Tracking API. This is called in response to the user clicking the 'Start' Button.
+     */
+    private void setTangoListeners() {
+        // Select coordinate frame pair.
+        ArrayList<TangoCoordinateFramePair> framePairs = new ArrayList<TangoCoordinateFramePair>();
+        framePairs.add(new TangoCoordinateFramePair(
+                TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
+                TangoPoseData.COORDINATE_FRAME_DEVICE));
+
+        // Listen for new Tango data.
+        mTango.connectListener(framePairs, new Tango.OnTangoUpdateListener() {
+            @Override
+            public void onPoseAvailable(final TangoPoseData pose) {
+                synchronized (MotionTrackingActivity.this) {
+                    // When we receive the first onPoseAvailable callback, we now the Tango has
+                    // located itself.
+                    mIsTangoPoseReady.compareAndSet(false, true);
+                }
+            }
+
+            @Override
+            public void onXyzIjAvailable(TangoXyzIjData xyzIj) {
+                // We are not using onXyzIjAvailable for this app.
+            }
+
+            @Override
+            public void onPointCloudAvailable(final TangoPointCloudData pointCloudData) {
+                // We are not using onPointCloudAvailable for this app.
+            }
+
+            @Override
+            public void onTangoEvent(final TangoEvent event) {
+                // Ignoring TangoEvents.
+            }
+
+            @Override
+            public void onFrameAvailable(int cameraId) {
+                // We are not using onFrameAvailable for this application.
+            }
+        });
+    }
+
+    /**
+     * Connects the Rajawali surface view and its renderer. This is ideally called only once in
+     * onCreate.
+     */
+    private void setupRenderer() {
+        mSurfaceView.setEGLContextClientVersion(2);
+        mRenderer.getCurrentScene().registerFrameCallback(new ASceneFrameCallback() {
+            @Override
+            public void onPreFrame(long sceneTime, double deltaTime) {
+                // If the Tango has not located itself, we won't do anything, since we can't get a
+                // valid pose.
+                if (!mIsTangoPoseReady.get()) {
+                    return;
+                }
+
+                // Synchronize to avoid concurrent access from the Tango callback thread below.
+                synchronized (MotionTrackingActivity.this) {
+                    // Update the scene objects with the latest device position and orientation
+                    // information.
+                    try {
+                        TangoPoseData pose =
+                                TangoSupport.getPoseAtTime(0.0,
+                                        TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
+                                        TangoPoseData.COORDINATE_FRAME_DEVICE,
+                                        TangoSupport.TANGO_SUPPORT_ENGINE_OPENGL,
+                                        mCurrentDisplayOrientation);
+
+                        if (pose.statusCode == TangoPoseData.POSE_VALID) {
+                            // Update the camera pose from the renderer
+                            mRenderer.updateRenderCameraPose(pose);
+                        }
+                    } catch (TangoErrorException e) {
+                        Log.e(TAG, "TangoSupport.getPoseAtTime error", e);
+                    }
+                }
+            }
+
+            @Override
+            public void onPreDraw(long sceneTime, double deltaTime) {
+
+            }
+
+            @Override
+            public void onPostFrame(long sceneTime, double deltaTime) {
+
+            }
+
+            @Override
+            public boolean callPreFrame() {
+                return true;
+            }
+        });
+
+        mSurfaceView.setSurfaceRenderer(mRenderer);
+        // Set render mode to RENDERMODE_CONTINUOUSLY.
+        mSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
     }
 }

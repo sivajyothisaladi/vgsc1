@@ -21,13 +21,16 @@ import com.google.atap.tangoservice.Tango.OnTangoUpdateListener;
 import com.google.atap.tangoservice.TangoCameraIntrinsics;
 import com.google.atap.tangoservice.TangoConfig;
 import com.google.atap.tangoservice.TangoCoordinateFramePair;
+import com.google.atap.tangoservice.TangoErrorException;
 import com.google.atap.tangoservice.TangoEvent;
 import com.google.atap.tangoservice.TangoException;
 import com.google.atap.tangoservice.TangoOutOfDateException;
+import com.google.atap.tangoservice.TangoPointCloudData;
 import com.google.atap.tangoservice.TangoPoseData;
 import com.google.atap.tangoservice.TangoXyzIjData;
 
 import android.app.Activity;
+import android.opengl.Matrix;
 import android.os.Bundle;
 import android.os.Handler;
 import android.util.Log;
@@ -44,8 +47,6 @@ import java.util.ArrayList;
 import java.util.Stack;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import com.projecttango.rajawali.DeviceExtrinsics;
-import com.projecttango.rajawali.ScenePoseCalculator;
 import com.projecttango.tangosupport.TangoPointCloudManager;
 import com.projecttango.tangosupport.TangoSupport;
 
@@ -53,13 +54,13 @@ import com.projecttango.tangosupport.TangoSupport;
  * An example showing how to build a very simple point to point measurement app
  * in Java. It uses the TangoSupportLibrary to do depth calculations using
  * the PointCloud data. Whenever the user clicks on the camera display, a point
- * is recorded from the PointCloud data closest to the point of the touch. 
+ * is recorded from the PointCloud data closest to the point of the touch.
  * consecutive touches are used as the two points for a distance measurement.
- *
+ * <p/>
  * Note that it is important to include the KEY_BOOLEAN_LOWLATENCYIMUINTEGRATION
  * configuration parameter in order to achieve best results synchronizing the
  * Rajawali virtual world with the RGB camera.
- *
+ * <p/>
  * For more details on the augmented reality effects, including color camera texture rendering,
  * see java_augmented_reality_example or java_hello_video_example.
  */
@@ -70,18 +71,14 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
     // This is the rate at which we query for distance data.
     private static final int UPDATE_UI_INTERVAL_MS = 100;
 
-    public static final TangoCoordinateFramePair FRAME_PAIR = new TangoCoordinateFramePair(
-            TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
-            TangoPoseData.COORDINATE_FRAME_DEVICE);
-    private static final int INVALID_TEXTURE_ID = -1;
+    private static final int INVALID_TEXTURE_ID = 0;
 
     private RajawaliSurfaceView mSurfaceView;
     private PointToPointRenderer mRenderer;
     private TangoCameraIntrinsics mIntrinsics;
-    private DeviceExtrinsics mExtrinsics;
     private TangoPointCloudManager mPointCloudManager;
     private Tango mTango;
-    private AtomicBoolean mIsConnected = new AtomicBoolean(false);
+    private boolean mIsConnected = false;
     private double mCameraPoseTimestamp = 0;
     private TextView mDistanceMeasure;
 
@@ -91,7 +88,7 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
     private AtomicBoolean mIsFrameAvailableTangoThread = new AtomicBoolean(false);
     private double mRgbTimestampGlThread;
 
-    private Vector3[] mLinePoints = new Vector3[2];
+    private float[][] mLinePoints = new float[2][3];
     private boolean mPointSwitch = true;
 
     // Handles the debug text UI update loop.
@@ -105,7 +102,6 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         mRenderer = new PointToPointRenderer(this);
         mSurfaceView.setSurfaceRenderer(mRenderer);
         mSurfaceView.setOnTouchListener(this);
-        mTango = new Tango(this);
         mPointCloudManager = new TangoPointCloudManager();
         mDistanceMeasure = (TextView) findViewById(R.id.distance_textview);
         mLinePoints[0] = null;
@@ -122,13 +118,14 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         // will block here until all Tango callback calls are finished. If you lock against this
         // object in a Tango callback thread it will cause a deadlock.
         synchronized (this) {
-            if (mIsConnected.compareAndSet(true, false)) {
+            if (mIsConnected) {
                 mRenderer.getCurrentScene().clearFrameCallbacks();
                 mTango.disconnectCamera(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
                 // We need to invalidate the connected texture ID so that we cause a re-connection
                 // in the OpenGL thread after resume
                 mConnectedTextureIdGlThread = INVALID_TEXTURE_ID;
                 mTango.disconnect();
+                mIsConnected = false;
             }
         }
     }
@@ -139,15 +136,27 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         // Synchronize against disconnecting while the service is being used in the OpenGL thread or
         // in the UI thread.
         synchronized (this) {
-            if (mIsConnected.compareAndSet(false, true)) {
-                try {
-                    connectTango();
-                    connectRenderer();
-                } catch (TangoOutOfDateException e) {
-                    Toast.makeText(getApplicationContext(),
-                            R.string.tango_out_of_date_exception,
-                            Toast.LENGTH_SHORT).show();
-                }
+            if (!mIsConnected) {
+                // Initialize Tango Service as a normal Android Service, since we call
+                // mTango.disconnect() in onPause, this will unbind Tango Service, so
+                // everytime when onResume get called, we should create a new Tango object.
+                mTango = new Tango(PointToPointActivity.this, new Runnable() {
+                    // Pass in a Runnable to be called from UI thread when Tango is ready,
+                    // this Runnable will be running on a new thread.
+                    // When Tango is ready, we can call Tango functions safely here only
+                    // when there is no UI thread changes involved.
+                    @Override
+                    public void run() {
+                        try {
+                            TangoSupport.initialize();
+                            connectTango();
+                            connectRenderer();
+                            mIsConnected = true;
+                        } catch (TangoOutOfDateException e) {
+                            Log.e(TAG, getString(R.string.tango_out_of_date_exception), e);
+                        }
+                    }
+                });
             }
         }
         mHandler.post(mUpdateUiLoopRunnable);
@@ -168,6 +177,14 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
                 TangoConfig.KEY_BOOLEAN_LOWLATENCYIMUINTEGRATION, true);
         config.putBoolean(TangoConfig.KEY_BOOLEAN_DEPTH, true);
         config.putBoolean(TangoConfig.KEY_BOOLEAN_COLORCAMERA, true);
+
+        // Drift correction allows motion tracking to recover after it loses tracking.
+        //
+        // The drift corrected pose is is available through the frame pair with
+        // base frame AREA_DESCRIPTION and target frame DEVICE.
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_DRIFT_CORRECTION, true);
+        config.putInt(TangoConfig.KEY_INT_DEPTH_MODE, TangoConfig.TANGO_DEPTH_MODE_POINT_CLOUD);
+
         mTango.connect(config);
 
         // No need to add any coordinate frame pairs since we are not
@@ -193,8 +210,13 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
 
             @Override
             public void onXyzIjAvailable(TangoXyzIjData xyzIj) {
+                // We are not using onXyzIjAvailable for this app.
+            }
+
+            @Override
+            public void onPointCloudAvailable(TangoPointCloudData pointCloud) {
                 // Save the cloud and point data for later use.
-                mPointCloudManager.updateXyzIj(xyzIj);
+                mPointCloudManager.updatePointCloud(pointCloud);
             }
 
             @Override
@@ -203,9 +225,6 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
             }
         });
 
-        // Get extrinsics from device for use in transforms. This needs
-        // to be done after connecting Tango and listeners.
-        mExtrinsics = setupExtrinsics(mTango);
         mIntrinsics = mTango.getCameraIntrinsics(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
     }
 
@@ -223,48 +242,74 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
                 // onRender callbacks had a chance to run and before scene objects are rendered
                 // into the scene.
 
-                // Prevent concurrent access to {@code mIsFrameAvailableTangoThread} from the Tango
-                // callback thread and service disconnection from an onPause event.
-                synchronized (PointToPointActivity.this) {
-                    // Don't execute any tango API actions if we're not connected to the service
-                    if (!mIsConnected.get()) {
-                        return;
-                    }
+                try {
+                    // Prevent concurrent access to {@code mIsFrameAvailableTangoThread} from the
+                    // Tango callback thread and service disconnection from an onPause event.
+                    synchronized (PointToPointActivity.this) {
+                        // Don't execute any tango API actions if we're not connected to the service
+                        if (!mIsConnected) {
+                            return;
+                        }
 
-                    // Set-up scene camera projection to match RGB camera intrinsics
-                    if (!mRenderer.isSceneCameraConfigured()) {
-                        mRenderer.setProjectionMatrix(mIntrinsics);
-                    }
+                        // Set-up scene camera projection to match RGB camera intrinsics
+                        if (!mRenderer.isSceneCameraConfigured()) {
+                            mRenderer.setProjectionMatrix(
+                                    projectionMatrixFromCameraIntrinsics(mIntrinsics));
+                        }
 
-                    // Connect the camera texture to the OpenGL Texture if necessary
-                    // NOTE: When the OpenGL context is recycled, Rajawali may re-generate the
-                    // texture with a different ID.
-                    if (mConnectedTextureIdGlThread != mRenderer.getTextureId()) {
-                        mTango.connectTextureId(TangoCameraIntrinsics.TANGO_CAMERA_COLOR,
-                                mRenderer.getTextureId());
-                        mConnectedTextureIdGlThread = mRenderer.getTextureId();
-                        Log.d(TAG, "connected to texture id: " + mRenderer.getTextureId());
-                    }
+                        // Connect the camera texture to the OpenGL Texture if necessary
+                        // NOTE: When the OpenGL context is recycled, Rajawali may re-generate the
+                        // texture with a different ID.
+                        if (mConnectedTextureIdGlThread != mRenderer.getTextureId()) {
+                            mTango.connectTextureId(TangoCameraIntrinsics.TANGO_CAMERA_COLOR,
+                                    mRenderer.getTextureId());
+                            mConnectedTextureIdGlThread = mRenderer.getTextureId();
+                            Log.d(TAG, "connected to texture id: " + mRenderer.getTextureId());
+                        }
 
-                    // If there is a new RGB camera frame available, update the texture with it
-                    if (mIsFrameAvailableTangoThread.compareAndSet(true, false)) {
-                        mRgbTimestampGlThread =
-                                mTango.updateTexture(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
-                    }
+                        // If there is a new RGB camera frame available, update the texture with it
+                        if (mIsFrameAvailableTangoThread.compareAndSet(true, false)) {
+                            mRgbTimestampGlThread =
+                                    mTango.updateTexture(TangoCameraIntrinsics.TANGO_CAMERA_COLOR);
+                        }
 
-                    // If a new RGB frame has been rendered, update the camera pose to match.
-                    if (mRgbTimestampGlThread > mCameraPoseTimestamp) {
-                        // Calculate the device pose at the camera frame update time.
-                        TangoPoseData lastFramePose = mTango.getPoseAtTime(mRgbTimestampGlThread,
-                            FRAME_PAIR);
-                        if (lastFramePose.statusCode == TangoPoseData.POSE_VALID) {
-                            // Update the camera pose from the renderer
-                            mRenderer.updateRenderCameraPose(lastFramePose, mExtrinsics);
-                            mCameraPoseTimestamp = lastFramePose.timestamp;
-                        } else {
-                            Log.w(TAG, "Can't get device pose at time: " + mRgbTimestampGlThread);
+                        // If a new RGB frame has been rendered, update the camera pose to match.
+                        if (mRgbTimestampGlThread > mCameraPoseTimestamp) {
+                            // Calculate the camera color pose at the camera frame update time in
+                            // OpenGL engine.
+                            //
+                            // When drift correction mode is enabled in config file, we need
+                            // to query the device with respect to Area Description pose in
+                            // order to use the drift corrected pose.
+                            //
+                            // Note that if you don't want to use the drift corrected pose, the
+                            // normal device with respect to start of service pose is still
+                            // available.
+                            TangoPoseData lastFramePose = TangoSupport.getPoseAtTime(
+                                    mRgbTimestampGlThread,
+                                    TangoPoseData.COORDINATE_FRAME_AREA_DESCRIPTION,
+                                    TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR,
+                                    TangoSupport.TANGO_SUPPORT_ENGINE_OPENGL, 0);
+                            if (lastFramePose.statusCode == TangoPoseData.POSE_VALID) {
+                                // Update the camera pose from the renderer
+                                mRenderer.updateRenderCameraPose(lastFramePose);
+                                mCameraPoseTimestamp = lastFramePose.timestamp;
+                            } else {
+                                // When the pose status is not valid, it indicates the tracking has
+                                // been lost. In this case, we simply stop rendering.
+                                //
+                                // This is also the place to display UI to suggest the user walk
+                                // to recover tracking.
+                                Log.w(TAG, "Can't get device pose at time: " +
+                                        mRgbTimestampGlThread);
+                            }
                         }
                     }
+                    // Avoid crashing the application due to unhandled exceptions
+                } catch (TangoErrorException e) {
+                    Log.e(TAG, "Tango API call error within the OpenGL render thread", e);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Exception on the OpenGL thread", t);
                 }
             }
 
@@ -286,25 +331,29 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
     }
 
     /**
-     * Calculates and stores the fixed transformations between the device and
-     * the various sensors to be used later for transformations between frames.
+     * Use Tango camera intrinsics to calculate the projection Matrix for the Rajawali scene.
      */
-    private static DeviceExtrinsics setupExtrinsics(Tango tango) {
-        // Create camera to IMU transform.
-        TangoCoordinateFramePair framePair = new TangoCoordinateFramePair();
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR;
-        TangoPoseData imuTrgbPose = tango.getPoseAtTime(0.0, framePair);
+    private static float[] projectionMatrixFromCameraIntrinsics(TangoCameraIntrinsics intrinsics) {
+        // Uses frustumM to create a projection matrix taking into account calibrated camera
+        // intrinsic parameter.
+        // Reference: http://ksimek.github.io/2013/06/03/calibrated_cameras_in_opengl/
+        float near = 0.1f;
+        float far = 100;
 
-        // Create device to IMU transform.
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_DEVICE;
-        TangoPoseData imuTdevicePose = tango.getPoseAtTime(0.0, framePair);
+        float xScale = near / (float) intrinsics.fx;
+        float yScale = near / (float) intrinsics.fy;
+        float xOffset = (float) (intrinsics.cx - (intrinsics.width / 2.0)) * xScale;
+        // Color camera's coordinates has y pointing downwards so we negate this term.
+        float yOffset = (float) -(intrinsics.cy - (intrinsics.height / 2.0)) * yScale;
 
-        // Create depth camera to IMU transform.
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH;
-        TangoPoseData imuTdepthPose = tango.getPoseAtTime(0.0, framePair);
-
-        return new DeviceExtrinsics(imuTdevicePose, imuTrgbPose, imuTdepthPose);
+        float m[] = new float[16];
+        Matrix.frustumM(m, 0,
+                xScale * (float) -intrinsics.width / 2.0f - xOffset,
+                xScale * (float) intrinsics.width / 2.0f - xOffset,
+                yScale * (float) -intrinsics.height / 2.0f - yOffset,
+                yScale * (float) intrinsics.height / 2.0f - yOffset,
+                near, far);
+        return m;
     }
 
     @Override
@@ -318,7 +367,7 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
                 // Place point near the clicked point using the latest point cloud data
                 // Synchronize against concurrent access to the RGB timestamp in the OpenGL thread
                 // and a possible service disconnection due to an onPause event.
-                Vector3 rgbPoint;
+                float[] rgbPoint;
                 synchronized (this) {
                     rgbPoint = getDepthAtTouchPosition(u, v, mRgbTimestampGlThread);
                 }
@@ -347,13 +396,13 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
     }
 
     /**
-     * Use the TangoSupport library with point cloud data to calculate the depth 
-     * of the point closest to where the user touches the screen. It returns a 
+     * Use the TangoSupport library with point cloud data to calculate the depth
+     * of the point closest to where the user touches the screen. It returns a
      * Vector3 in openGL world space.
      */
-    private Vector3 getDepthAtTouchPosition(float u, float v, double rgbTimestamp) {
-        TangoXyzIjData xyzIj = mPointCloudManager.getLatestXyzIj();
-        if (xyzIj == null) {
+    private float[] getDepthAtTouchPosition(float u, float v, double rgbTimestamp) {
+        TangoPointCloudData pointCloud = mPointCloudManager.getLatestPointCloud();
+        if (pointCloud == null) {
             return null;
         }
 
@@ -362,25 +411,37 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         // cloud was acquired.
         TangoPoseData colorTdepthPose = TangoSupport.calculateRelativePose(
                 rgbTimestamp, TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR,
-                xyzIj.timestamp, TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH);
+                pointCloud.timestamp, TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH);
 
-        float[] point = TangoSupport.getDepthAtPointNearestNeighbor(xyzIj, mIntrinsics,
+        float[] point = TangoSupport.getDepthAtPointNearestNeighbor(pointCloud,
                 colorTdepthPose, u, v);
         if (point == null) {
             return null;
         }
 
-        return ScenePoseCalculator.getPointInEngineFrame(
-                    new Vector3(point[0], point[1], point[2]),
-                    ScenePoseCalculator.matrixToTangoPose(mExtrinsics.getDeviceTDepthCamera()), 
-                    mTango.getPoseAtTime(rgbTimestamp, FRAME_PAIR));
+        // Get the transform from depth camera to OpenGL world at the timestamp of the cloud.
+        TangoSupport.TangoMatrixTransformData transform =
+                TangoSupport.getMatrixTransformAtTime(pointCloud.timestamp,
+                        TangoPoseData.COORDINATE_FRAME_AREA_DESCRIPTION,
+                        TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH,
+                        TangoSupport.TANGO_SUPPORT_ENGINE_OPENGL,
+                        TangoSupport.TANGO_SUPPORT_ENGINE_TANGO);
+        if (transform.statusCode == TangoPoseData.POSE_VALID) {
+            float[] dephtPoint = new float[]{point[0], point[1], point[2], 1};
+            float[] openGlPoint = new float[4];
+            Matrix.multiplyMV(openGlPoint, 0, transform.matrix, 0, dephtPoint, 0);
+            return openGlPoint;
+        } else {
+            Log.w(TAG, "Could not get depth camera transform at time " + pointCloud.timestamp);
+        }
+        return null;
     }
 
     /**
      * Update the oldest line endpoint to the value passed into this function.
      * This will also flag the line for update on the next render pass.
      */
-    private synchronized void updateLine(Vector3 worldPoint) {
+    private synchronized void updateLine(float[] worldPoint) {
         if (mPointSwitch) {
             mPointSwitch = !mPointSwitch;
             mLinePoints[0] = worldPoint;
@@ -399,13 +460,13 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         // Place the line based on the two points.
         if (mLinePoints[0] != null && mLinePoints[1] != null) {
             Stack<Vector3> points = new Stack<Vector3>();
-            points.push(mLinePoints[0]);
-            points.push(mLinePoints[1]);
+            points.push(new Vector3(mLinePoints[0][0], mLinePoints[0][1], mLinePoints[0][2]));
+            points.push(new Vector3(mLinePoints[1][0], mLinePoints[1][1], mLinePoints[1][2]));
             return points;
         }
         return null;
     }
-    
+
     /*
      * Remove all the points from the Scene.
      */
@@ -424,12 +485,12 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         if (mLinePoints[0] == null || mLinePoints[1] == null) {
             return "Null";
         }
-        Vector3 p1 = mLinePoints[0];
-        Vector3 p2 = mLinePoints[1];
+        float[] p1 = mLinePoints[0];
+        float[] p2 = mLinePoints[1];
         double separation = Math.sqrt(
-                                Math.pow(p1.x - p2.x, 2) + 
-                                Math.pow(p1.y - p2.y, 2) + 
-                                Math.pow(p1.z - p2.z, 2));
+                Math.pow(p1[0] - p2[0], 2) +
+                        Math.pow(p1[1] - p2[1], 2) +
+                        Math.pow(p1[2] - p2[2], 2));
         return String.format("%.2f", separation) + " meters";
     }
 
@@ -441,7 +502,7 @@ public class PointToPointActivity extends Activity implements View.OnTouchListen
         }
     };
 
-    private synchronized void updateUi(){
+    private synchronized void updateUi() {
         try {
             mDistanceMeasure.setText(getPointSeparation());
         } catch (Exception e) {
