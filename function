@@ -1,0 +1,17 @@
+<html>
+<body>
+
+
+<p>This example calls a function which performs a adding and returns the result:</p>
+<p id="demo"></p>
+
+<script>
+function myFunction(a, b) {
+return a + b;
+}
+document.getElementById("demo").innerHTML = myFunction(24, 5);
+</script>
+
+
+</body>
+</html>
