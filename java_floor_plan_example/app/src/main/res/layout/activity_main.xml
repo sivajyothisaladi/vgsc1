@@ -3,9 +3,9 @@
     xmlns:surfaceview="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context="com.projecttango.experiments.floorplansample.FloorplanActivity">
+    tools:context="com.projecttango.experiments.floorplan.FloorplanActivity">
 
-    <com.projecttango.rajawali.ar.TangoRajawaliView
+    <org.rajawali3d.surface.RajawaliSurfaceView
         android:id="@+id/ar_view"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -20,7 +20,8 @@
         android:textSize="22sp"
         android:layout_width="120dp"
         android:layout_height="100dp"
-        android:layout_margin="30dp" />
+        android:layout_margin="30dp"
+        android:onClick="finishPlan" />
 
     <LinearLayout
         android:id="@+id/progress_group"
